@@ -18,10 +18,9 @@ styleEl.textContent = `
     --secondary: #2d2d2d;
     --border: #2f2f2f;
 
-    /* tamanhos fáceis de ajustar */
-    --checkbox-size: 22px; /* tamanho do checkbox */
-    --logo-size: 28px;     /* tamanho da logo */
-    --opt-gap: 12px;       /* espaçamento entre checkbox e logo/texto */
+    --checkbox-size: 22px;
+    --logo-size: 28px;
+    --opt-gap: 12px;
   }
 
   body, .panel {
@@ -282,6 +281,7 @@ if (deployBtn) deployBtn.addEventListener('click', () => {
   const repoUrl = (document.getElementById('repoUrl') || {}).value || '';
   const message = (document.getElementById('description') || {}).value || '';
   const vercelToken = (document.getElementById('vercelToken') || {}).value || '';
+  const ghToken = (document.getElementById('githubToken') || {}).value || '';
 
   setProgress(2, 'Iniciando deploy...');
   vscode.postMessage({
@@ -291,7 +291,8 @@ if (deployBtn) deployBtn.addEventListener('click', () => {
     repoUrl,
     message,
     files: selectedFiles,
-    token: vercelToken
+    token: vercelToken,
+    ghToken
   });
 
   appendLog(`🚀 Deploy solicitado (GitHub: ${github ? 'Sim' : 'Não'} | Vercel: ${vercel ? 'Sim' : 'Não'})`);

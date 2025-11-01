@@ -6,6 +6,11 @@ import * as fs from 'fs';
 
 type RunResult = { ok: boolean; stdout: string; stderr: string };
 
+const VERCEL_SECRET_KEY = 'vercelToken';
+const GITHUB_SECRET_KEY = 'githubToken';
+const GLOBAL_REPO_KEY = 'repoUrl';
+
+// -------------------- Helpers --------------------
 function runCommand(cmd: string, cwd: string, onData?: (d: string) => void): Promise<RunResult> {
   return new Promise(resolve => {
     const p = exec(cmd, { cwd, maxBuffer: 1024 * 1024 * 10 }, (err, stdout, stderr) => {
@@ -26,383 +31,11 @@ function makeSafeName(name: string) {
     .slice(0, 100);
 }
 
-const VERCEL_SECRET_KEY = 'vercelToken';
-const GITHUB_SECRET_KEY = 'githubToken';
-const GLOBAL_REPO_KEY = 'repoUrl';
-
-export function activate(context: vscode.ExtensionContext) {
-  console.log('🚀 Deploy extension activated');
-
-  const disposable = vscode.commands.registerCommand('deploy-extension.deploy', async () => {
-    const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
-    const projectRoot = workspaceFolder ? workspaceFolder.uri.fsPath : path.resolve(context.extensionUri.fsPath, '..');
-
-    if (!fs.existsSync(projectRoot)) {
-      vscode.window.showErrorMessage('Pasta do projeto não encontrada. Abra a pasta raiz do projeto.');
-      return;
-    }
-
-    const panel = vscode.window.createWebviewPanel('deployPanel', 'Deploy Automático', vscode.ViewColumn.One, {
-      enableScripts: true,
-      localResourceRoots: [
-        vscode.Uri.joinPath(context.extensionUri, 'media'),
-        vscode.Uri.joinPath(context.extensionUri, 'webview')
-      ]
-    });
-
-    const scriptUri = panel.webview.asWebviewUri(vscode.Uri.joinPath(context.extensionUri, 'media', 'main.js'));
-    const styleUri = panel.webview.asWebviewUri(vscode.Uri.joinPath(context.extensionUri, 'media', 'style.css'));
-    const githubIcon = panel.webview.asWebviewUri(vscode.Uri.joinPath(context.extensionUri, 'media', 'github.png')).toString();
-    const vercelIcon = panel.webview.asWebviewUri(vscode.Uri.joinPath(context.extensionUri, 'media', 'vercel.png')).toString();
-
-    panel.webview.html = getWebviewContent(panel.webview, scriptUri.toString(), styleUri.toString(), githubIcon, vercelIcon);
-    vscode.window.showInformationMessage('Painel de Deploy aberto!');
-
-    const sendLog = (t: string) => panel.webview.postMessage({ type: 'log', text: String(t) });
-
-    async function sendStatus() {
-      const res = await runCommand('git status --porcelain', projectRoot, d => sendLog(d));
-      const files = (res.stdout || '')
-        .split('\n')
-        .map(l => l.trim())
-        .filter(Boolean)
-        .map(l => (l.length > 3 ? l.slice(3).trim() : l.trim()));
-      panel.webview.postMessage({ type: 'status', files });
-    }
-
-    await sendStatus();
-
-    // helper to store secret only if changed and notify properly
-    async function saveSecretIfNew(secretKey: string, token: string, label: string) {
-      const normalized = String(token || '').trim();
-      if (!normalized) {
-        vscode.window.showWarningMessage(`${label} vazio. Informe um token válido.`);
-        sendLog(`${label} vazio. Nada salvo.`);
-        panel.webview.postMessage({ type: 'tokenSaveResult', key: secretKey, ok: false, text: 'vazio' });
-        return;
-      }
-      const existing = await context.secrets.get(secretKey);
-      if (existing === normalized) {
-        const msg = `${label} já salvo.`;
-        vscode.window.showWarningMessage(msg);
-        sendLog(msg);
-        panel.webview.postMessage({ type: 'tokenSaveResult', key: secretKey, ok: false, text: 'duplicado' });
-        return;
-      }
-      await context.secrets.store(secretKey, normalized);
-      const msg = `${label} salvo com segurança.`;
-      vscode.window.showInformationMessage(msg);
-      sendLog(msg);
-      panel.webview.postMessage({ type: 'tokenSaveResult', key: secretKey, ok: true, text: 'salvo' });
-    }
-
-    // helper to save repo URL in globalState
-    async function saveRepoUrlIfNew(url: string) {
-      const normalized = String(url || '').trim();
-      if (!normalized) {
-        vscode.window.showWarningMessage('Repo URL vazio. Informe uma URL válida.');
-        sendLog('Repo URL vazio. Nada salvo.');
-        panel.webview.postMessage({ type: 'repoSaveResult', ok: false, text: 'vazio' });
-        return;
-      }
-      const existing = context.globalState.get<string>(GLOBAL_REPO_KEY, '');
-      if (existing === normalized) {
-        const msg = 'Repo URL já salvo.';
-        vscode.window.showWarningMessage(msg);
-        sendLog(msg);
-        panel.webview.postMessage({ type: 'repoSaveResult', ok: false, text: 'duplicado' });
-        return;
-      }
-      await context.globalState.update(GLOBAL_REPO_KEY, normalized);
-      const msg = 'Repo URL salvo com segurança.';
-      vscode.window.showInformationMessage(msg);
-      sendLog(msg);
-      panel.webview.postMessage({ type: 'repoSaveResult', ok: true, text: 'salvo' });
-    }
-
-    // helper: extract owner/repo from https://github.com/owner/repo(.git)
-    function getRepoPathFromUrl(url: string | undefined) {
-      if (!url) return '';
-      try {
-        let u = String(url).trim();
-        if (u.startsWith('https://')) u = u.replace('https://', '');
-        if (u.includes('@')) {
-          const parts = u.split('@');
-          u = parts[parts.length - 1];
-        }
-        const parts = u.split('/');
-        const owner = parts[1] || '';
-        const repo = (parts[2] || '').replace(/\.git$/, '');
-        return owner && repo ? `${owner}/${repo}` : '';
-      } catch {
-        return '';
-      }
-    }
-
-    // helper to test GitHub access via git ls-remote (uses token if provided)
-    async function testGithubAccess(repoUrl: string | undefined, ghToken: string | undefined) {
-      try {
-        const repoPath = getRepoPathFromUrl(repoUrl);
-        if (!repoPath) {
-          return { ok: false, text: 'Repo URL inválida ou não informada.' };
-        }
-        let testUrl = repoUrl || `https://github.com/${repoPath}.git`;
-        if (ghToken && testUrl.startsWith('https://')) {
-          testUrl = testUrl.replace('https://', `https://${ghToken}@`);
-        }
-        const res = await runCommand(`git ls-remote --exit-code "${testUrl}"`, projectRoot, d => sendLog(d));
-        if (res.ok) return { ok: true, text: 'Acesso ao GitHub OK (ls-remote funcionou).' };
-        return { ok: false, text: 'Falha ao acessar repositório remoto: ' + (res.stderr || res.stdout) };
-      } catch (err: any) {
-        return { ok: false, text: 'Erro testando GitHub: ' + (err?.message ?? String(err)) };
-      }
-    }
-
-    // helper to test Vercel token
-    async function testVercelAccess(vercelToken: string | undefined) {
-      try {
-        if (!vercelToken) return { ok: false, text: 'Token Vercel não informado.' };
-        const cmd = `npx vercel whoami --token="${vercelToken}"`;
-        const res = await runCommand(cmd, projectRoot, d => sendLog(d));
-        if (res.ok && (res.stdout || '').trim()) {
-          return { ok: true, text: 'Vercel: ' + res.stdout.trim().split('\n')[0] };
-        }
-        return { ok: false, text: 'Falha autenticar Vercel: ' + (res.stderr || res.stdout) };
-      } catch (err: any) {
-        return { ok: false, text: 'Erro testando Vercel: ' + (err?.message ?? String(err)) };
-      }
-    }
-
-    // Listen messages from the webview
-    panel.webview.onDidReceiveMessage(async (msg: any) => {
-      try {
-        if (msg.type === 'requestStatus') {
-          await sendStatus();
-        }
-
-        // Save GitHub token
-        else if (msg.type === 'saveGithubToken') {
-          await saveSecretIfNew(GITHUB_SECRET_KEY, String(msg.token || ''), 'GitHub token');
-        }
-
-        // Save Vercel token
-        else if (msg.type === 'saveVercelToken') {
-          await saveSecretIfNew(VERCEL_SECRET_KEY, String(msg.token || ''), 'Token do Vercel');
-        }
-
-        // Save repo URL
-        else if (msg.type === 'saveRepoUrl') {
-          await saveRepoUrlIfNew(String(msg.url || ''));
-        }
-
-        // Clear a saved secret (GitHub)
-        else if (msg.type === 'clearGithubToken') {
-          await context.secrets.delete(GITHUB_SECRET_KEY);
-          const msgText = 'GitHub token removido do armazenamento seguro.';
-          vscode.window.showInformationMessage(msgText);
-          sendLog(msgText);
-        }
-
-        // Clear Vercel token
-        else if (msg.type === 'clearVercelToken') {
-          await context.secrets.delete(VERCEL_SECRET_KEY);
-          const msgText = 'Token do Vercel removido do armazenamento seguro.';
-          vscode.window.showInformationMessage(msgText);
-          sendLog(msgText);
-        }
-
-        // Clear Repo URL
-        else if (msg.type === 'clearRepoUrl') {
-          await context.globalState.update(GLOBAL_REPO_KEY, '');
-          const msgText = 'Repo URL removida.';
-          vscode.window.showInformationMessage(msgText);
-          sendLog(msgText);
-        }
-
-        // Preview diff for a file
-        else if (msg.type === 'preview') {
-          const file = String(msg.file || '');
-          if (!file) {
-            panel.webview.postMessage({ type: 'preview', file, text: 'No file' });
-            return;
-          }
-          const r = await runCommand(`git diff -- "${file.replace(/"/g, '\\"')}"`, projectRoot, d => sendLog(d));
-          panel.webview.postMessage({ type: 'preview', file, text: r.stdout || r.stderr });
-        }
-
-        // Test Deploy (checks tokens, repo accessibility, local git)
-        else if (msg.type === 'testDeploy') {
-          panel.webview.postMessage({ type: 'log', text: '🔎 Iniciando checagem (Testar Deploy)...' });
-
-          const repoUrlFromField = String(msg.repoUrl || '').trim();
-          const repoUrlSaved = context.globalState.get<string>(GLOBAL_REPO_KEY, '').trim();
-          const repoUrlToUse = repoUrlFromField || repoUrlSaved || '';
-
-          const ghTokenFromField = String(msg.ghToken || '').trim();
-          const ghTokenSaved = await context.secrets.get(GITHUB_SECRET_KEY);
-          const ghTokenToUse = ghTokenFromField || ghTokenSaved || '';
-
-          const vercelTokenFromField = String(msg.vercelToken || '').trim();
-          const vercelTokenSaved = await context.secrets.get(VERCEL_SECRET_KEY);
-          const vercelTokenToUse = vercelTokenFromField || vercelTokenSaved || '';
-
-          // local git check
-          const gitVersion = await runCommand('git --version', projectRoot, d => sendLog(d));
-          const hasGit = gitVersion.ok;
-          panel.webview.postMessage({ type: 'log', text: `git --version: ${gitVersion.stdout || gitVersion.stderr}` });
-
-          let localRepo = false;
-          if (hasGit) {
-            const st = await runCommand('git rev-parse --is-inside-work-tree', projectRoot);
-            localRepo = st.ok && (st.stdout || '').toString().trim() === 'true';
-          }
-          panel.webview.postMessage({ type: 'log', text: `Repositório local: ${localRepo ? 'Sim' : 'Não'}` });
-
-          // GitHub test
-          let ghResult = { ok: false, text: 'Não verificado' };
-          if (!repoUrlToUse) {
-            ghResult = { ok: false, text: 'Repo URL não informada (salve a Repo URL ou preencha o campo).' };
-          } else {
-            sendLog('🔎 Testando acesso GitHub (ls-remote)...');
-            ghResult = await testGithubAccess(repoUrlToUse, ghTokenToUse);
-          }
-          panel.webview.postMessage({ type: 'log', text: `GitHub: ${ghResult.text}` });
-
-          // Vercel test
-          let vercelResult = { ok: false, text: 'Não verificado' };
-          if (!vercelTokenToUse) {
-            vercelResult = { ok: false, text: 'Token Vercel não disponível.' };
-          } else {
-            sendLog('🔎 Testando autenticação Vercel (npx vercel whoami)...');
-            vercelResult = await testVercelAccess(vercelTokenToUse);
-          }
-          panel.webview.postMessage({ type: 'log', text: `Vercel: ${vercelResult.text}` });
-
-          const summary = {
-            gitInstalled: hasGit,
-            localRepo,
-            github: ghResult,
-            vercel: vercelResult,
-            repoUrl: repoUrlToUse,
-            ghTokenProvided: !!ghTokenToUse,
-            vercelTokenProvided: !!vercelTokenToUse
-          };
-
-          panel.webview.postMessage({ type: 'testResult', summary });
-          panel.webview.postMessage({ type: 'log', text: '🔎 Teste finalizado.' });
-        }
-
-        // Deploy: respects targets (github/vercel), repo URL and saved tokens
-        else if (msg.type === 'deploy') {
-          panel.webview.postMessage({ type: 'log', text: 'Iniciando deploy...' });
-          const githubSelected = !!msg.github;
-          const vercelSelected = !!msg.vercel;
-          const repoUrlFromField = String(msg.repoUrl || '').trim();
-          const repoUrlSaved = context.globalState.get<string>(GLOBAL_REPO_KEY, '').trim();
-
-          let repoUrlToUse = repoUrlSaved;
-          if (repoUrlFromField) {
-            repoUrlToUse = repoUrlFromField;
-            await saveRepoUrlIfNew(repoUrlFromField);
-          }
-
-          const gitExists = fs.existsSync(path.join(projectRoot, '.git'));
-          if (!gitExists && repoUrlToUse) {
-            sendLog('Nenhum repositório Git local encontrado. Inicializando repositório...');
-            await runCommand('git init', projectRoot, d => sendLog(d));
-            await runCommand('git add .', projectRoot, d => sendLog(d));
-            await runCommand('git commit -m "Initial commit (automatic by Deploy Extension)" || true', projectRoot, d => sendLog(d));
-            let remoteUrl = repoUrlToUse;
-            if (githubSelected) {
-              const ghToken = (await context.secrets.get(GITHUB_SECRET_KEY)) || '';
-              if (ghToken && remoteUrl.startsWith('https://')) {
-                remoteUrl = remoteUrl.replace('https://', `https://${ghToken}@`);
-              }
-            }
-            await runCommand(`git remote add origin "${remoteUrl}"`, projectRoot, d => sendLog(d));
-            await runCommand('git branch -M main', projectRoot, d => sendLog(d));
-            const firstPush = await runCommand('git push -u origin main', projectRoot, d => sendLog(d));
-            sendLog(firstPush.stdout || firstPush.stderr);
-          }
-
-          const branchRes = await runCommand('git rev-parse --abbrev-ref HEAD', projectRoot);
-          const branch = (branchRes.stdout || '').trim() || 'main';
-
-          if (githubSelected) {
-            sendLog('🚀 Fazendo push para o GitHub...');
-            if (msg.files && msg.files.length) {
-              const quoted = msg.files.map((f: string) => `"${f.replace(/"/g, '\\"')}"`).join(' ');
-              await runCommand(`git add ${quoted}`, projectRoot, d => sendLog(d));
-            } else {
-              await runCommand('git add .', projectRoot, d => sendLog(d));
-            }
-            await runCommand(`git commit -m "${(msg.message || 'deploy: automatic').replace(/"/g, '\\"')}" || true`, projectRoot, d => sendLog(d));
-
-            const ghToken = (await context.secrets.get(GITHUB_SECRET_KEY)) || '';
-            let pushCmd = `git push origin ${branch}`;
-            if (ghToken) {
-              const remoteUrl = (context.globalState.get<string>(GLOBAL_REPO_KEY, '') || '').trim();
-              if (remoteUrl && remoteUrl.startsWith('https://')) {
-                const tokenRemote = remoteUrl.replace('https://', `https://${ghToken}@`);
-                await runCommand(`git remote set-url origin "${tokenRemote}"`, projectRoot, d => sendLog(d));
-                pushCmd = `git push origin ${branch}`;
-              } else {
-                const repoPath = getRepoPathFromUrl(repoUrlToUse) || '';
-                if (repoPath) pushCmd = `git push https://${ghToken}@github.com/${repoPath} ${branch}`.trim();
-              }
-            }
-            const pushRes = await runCommand(pushCmd, projectRoot, d => sendLog(d));
-            sendLog(pushRes.stdout || pushRes.stderr);
-          }
-
-          if (vercelSelected) {
-            sendLog('⚙️ Executando build e deploy no Vercel...');
-            const build = await runCommand('npm run build', projectRoot, d => sendLog(d));
-            if (!build.ok) {
-              vscode.window.showErrorMessage('Erro no build. Verifique o painel.');
-              sendLog('Build falhou: ' + (build.stderr || ''));
-              return;
-            }
-
-            const token = msg.token || (await context.secrets.get(VERCEL_SECRET_KEY)) || '';
-            if (!token) {
-              vscode.window.showErrorMessage('Token do Vercel não configurado.');
-              sendLog('Token do Vercel não configurado.');
-              return;
-            }
-
-            let baseName = path.basename(projectRoot);
-            try {
-              const pkg = JSON.parse(fs.readFileSync(path.join(projectRoot, 'package.json'), 'utf8'));
-              if (pkg && pkg.name) baseName = String(pkg.name);
-            } catch {}
-
-            const safeName = makeSafeName(baseName) || 'deploy-project';
-            const vercelCmd = `npx vercel --prod --token="${token}" --yes --name="${safeName}"`;
-            const vercelRes = await runCommand(vercelCmd, projectRoot, d => sendLog(d));
-            sendLog(vercelRes.stdout || vercelRes.stderr);
-          }
-
-          sendLog('✅ Deploy finalizado.');
-          await sendStatus();
-        }
-      } catch (err: any) {
-        sendLog('Erro: ' + (err?.message ?? String(err)));
-        vscode.window.showErrorMessage('Erro no processo de deploy: ' + (err?.message ?? String(err)));
-      }
-    });
-  });
-
-  const clearToken = vscode.commands.registerCommand('deploy-extension.clearVercelToken', async () => {
-    await context.secrets.delete(VERCEL_SECRET_KEY);
-    vscode.window.showInformationMessage('Token do Vercel removido do armazenamento seguro.');
-  });
-
-  context.subscriptions.push(disposable, clearToken);
+function normalizeFsPath(p: string) {
+  return path.resolve(p).replace(/\\/g, '/').toLowerCase();
 }
 
-/** Helper: extract owner/repo from a typical https://github.com/owner/repo.git URL */
-function getRepoPathFromUrl(url: string | undefined) {
+function getRepoPathFromUrl(url?: string) {
   if (!url) return '';
   try {
     let u = String(url).trim();
@@ -413,17 +46,14 @@ function getRepoPathFromUrl(url: string | undefined) {
     }
     const parts = u.split('/');
     const owner = parts[1] || '';
-    const repo = parts[2] ? parts[2].replace(/\.git$/, '') : '';
+    const repo = (parts[2] || '').replace(/\.git$/, '');
     return owner && repo ? `${owner}/${repo}` : '';
   } catch {
     return '';
   }
 }
 
-export function deactivate() {
-  console.log('Deploy extension deactivated');
-}
-
+// -------------------- Webview content (preserva HTML/CSS original via media/main.js) --------------------
 function getWebviewContent(webview: vscode.Webview, scriptUri: string, styleUri: string, githubIcon: string, vercelIcon: string) {
   const csp = webview.cspSource;
   return `<!doctype html>
@@ -685,6 +315,348 @@ function getWebviewContent(webview: vscode.Webview, scriptUri: string, styleUri:
   </script>
 </body>
 </html>`;
+}
+
+// -------------------- Core: panel + handlers --------------------
+export function activate(context: vscode.ExtensionContext) {
+  console.log('🚀 Deploy extension activated');
+
+  const command = vscode.commands.registerCommand('deploy-extension.deploy', async () => {
+    const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
+    const projectRoot = workspaceFolder ? workspaceFolder.uri.fsPath : path.resolve(context.extensionUri.fsPath, '..');
+
+    if (!fs.existsSync(projectRoot)) {
+      vscode.window.showErrorMessage('Pasta do projeto não encontrada. Abra a pasta raiz do projeto.');
+      return;
+    }
+
+    const panel = vscode.window.createWebviewPanel('deployPanel', 'Deploy Automático', vscode.ViewColumn.One, {
+      enableScripts: true,
+      localResourceRoots: [
+        vscode.Uri.joinPath(context.extensionUri, 'media'),
+        vscode.Uri.joinPath(context.extensionUri, 'webview')
+      ]
+    });
+
+    const scriptUri = panel.webview.asWebviewUri(vscode.Uri.joinPath(context.extensionUri, 'media', 'main.js'));
+    const styleUri = panel.webview.asWebviewUri(vscode.Uri.joinPath(context.extensionUri, 'media', 'style.css'));
+    const githubIcon = panel.webview.asWebviewUri(vscode.Uri.joinPath(context.extensionUri, 'media', 'github.png')).toString();
+    const vercelIcon = panel.webview.asWebviewUri(vscode.Uri.joinPath(context.extensionUri, 'media', 'vercel.png')).toString();
+
+    panel.webview.html = getWebviewContent(panel.webview, scriptUri.toString(), styleUri.toString(), githubIcon, vercelIcon);
+    vscode.window.showInformationMessage('Painel de Deploy aberto!');
+
+    const sendLog = (t: string) => panel.webview.postMessage({ type: 'log', text: String(t) });
+
+    // sendStatus: envia apenas arquivos abertos dentro do projectRoot; fallback para git status
+    async function sendStatus() {
+      const projectRootNorm = normalizeFsPath(projectRoot);
+      const openDocsFiltered = vscode.workspace.textDocuments
+        .filter(doc => {
+          if (doc.isUntitled) return false;
+          if (doc.uri.scheme !== 'file') return false;
+          try {
+            const docNorm = normalizeFsPath(doc.uri.fsPath);
+            return docNorm.startsWith(projectRootNorm);
+          } catch {
+            return false;
+          }
+        })
+        .map(doc => path.relative(projectRoot, doc.uri.fsPath).replace(/\\/g, '/') || doc.uri.fsPath);
+
+      sendLog(`sendStatus: projectRoot="${projectRoot}" - openDocsFiltered=${openDocsFiltered.length}`);
+
+      let files: string[] = openDocsFiltered;
+
+      if (!files || files.length === 0) {
+        const res = await runCommand('git status --porcelain', projectRoot, d => sendLog(d));
+        files = (res.stdout || '')
+          .split('\n')
+          .map(l => l.trim())
+          .filter(Boolean)
+          .map(l => (l.length > 3 ? l.slice(3).trim() : l.trim()));
+      }
+
+      panel.webview.postMessage({ type: 'status', files });
+    }
+
+    // helpers used by handlers below (save tokens/repo, tests and deploy)
+    async function saveSecretIfNew(secretKey: string, token: string, label: string) {
+      const normalized = String(token || '').trim();
+      if (!normalized) {
+        vscode.window.showWarningMessage(`${label} vazio. Informe um token válido.`);
+        sendLog(`${label} vazio. Nada salvo.`);
+        panel.webview.postMessage({ type: 'tokenSaved', key: secretKey, ok: false, text: 'vazio' });
+        return;
+      }
+      const existing = await context.secrets.get(secretKey);
+      if (existing === normalized) {
+        const msg = `${label} já salvo.`;
+        vscode.window.showWarningMessage(msg);
+        sendLog(msg);
+        panel.webview.postMessage({ type: 'tokenSaved', key: secretKey, ok: false, text: 'duplicado' });
+        return;
+      }
+      await context.secrets.store(secretKey, normalized);
+      const msg = `${label} salvo com segurança.`;
+      vscode.window.showInformationMessage(msg);
+      sendLog(msg);
+      panel.webview.postMessage({ type: 'tokenSaved', key: secretKey, ok: true, text: 'salvo' });
+    }
+
+    async function saveRepoUrlIfNew(url: string) {
+      const normalized = String(url || '').trim();
+      if (!normalized) {
+        vscode.window.showWarningMessage('Repo URL vazio. Informe uma URL válida.');
+        sendLog('Repo URL vazio. Nada salvo.');
+        panel.webview.postMessage({ type: 'repoSaveResult', ok: false, text: 'vazio' });
+        return;
+      }
+      const existing = context.globalState.get<string>(GLOBAL_REPO_KEY, '');
+      if (existing === normalized) {
+        const msg = 'Repo URL já salvo.';
+        vscode.window.showWarningMessage(msg);
+        sendLog(msg);
+        panel.webview.postMessage({ type: 'repoSaveResult', ok: false, text: 'duplicado' });
+        return;
+      }
+      await context.globalState.update(GLOBAL_REPO_KEY, normalized);
+      const msg = 'Repo URL salvo com segurança.';
+      vscode.window.showInformationMessage(msg);
+      sendLog(msg);
+      panel.webview.postMessage({ type: 'repoSaveResult', ok: true, text: 'salvo' });
+    }
+
+    async function testGithubAccess(repoUrl: string | undefined, ghToken: string | undefined) {
+      try {
+        const repoPath = getRepoPathFromUrl(repoUrl);
+        if (!repoPath) return { ok: false, text: 'Repo URL inválida ou não informada.' };
+        let testUrl = repoUrl || `https://github.com/${repoPath}.git`;
+        if (ghToken && testUrl.startsWith('https://')) testUrl = testUrl.replace('https://', `https://${ghToken}@`);
+        const res = await runCommand(`git ls-remote --exit-code "${testUrl}"`, projectRoot, d => sendLog(d));
+        if (res.ok) return { ok: true, text: 'Acesso ao GitHub OK (ls-remote funcionou).' };
+        return { ok: false, text: 'Falha ao acessar repositório remoto: ' + (res.stderr || res.stdout) };
+      } catch (err: any) {
+        return { ok: false, text: 'Erro testando GitHub: ' + (err?.message ?? String(err)) };
+      }
+    }
+
+    async function testVercelAccess(vercelToken: string | undefined) {
+      try {
+        if (!vercelToken) return { ok: false, text: 'Token Vercel não informado.' };
+        const cmd = `npx vercel whoami --token="${vercelToken}"`;
+        const res = await runCommand(cmd, projectRoot, d => sendLog(d));
+        if (res.ok && (res.stdout || '').trim()) {
+          return { ok: true, text: 'Vercel: ' + res.stdout.trim().split('\n')[0] };
+        }
+        return { ok: false, text: 'Falha autenticar Vercel: ' + (res.stderr || res.stdout) };
+      } catch (err: any) {
+        return { ok: false, text: 'Erro testando Vercel: ' + (err?.message ?? String(err)) };
+      }
+    }
+
+    // message handler
+    panel.webview.onDidReceiveMessage(async (msg: any) => {
+      try {
+        if (msg.type === 'requestStatus') {
+          await sendStatus();
+        } else if (msg.type === 'saveGithubToken') {
+          await saveSecretIfNew(GITHUB_SECRET_KEY, String(msg.token || ''), 'GitHub token');
+        } else if (msg.type === 'saveVercelToken') {
+          await saveSecretIfNew(VERCEL_SECRET_KEY, String(msg.token || ''), 'Token do Vercel');
+        } else if (msg.type === 'saveRepoUrl') {
+          await saveRepoUrlIfNew(String(msg.url || ''));
+        } else if (msg.type === 'clearGithubToken') {
+          await context.secrets.delete(GITHUB_SECRET_KEY);
+          const msgText = 'GitHub token removido do armazenamento seguro.';
+          vscode.window.showInformationMessage(msgText);
+          sendLog(msgText);
+          panel.webview.postMessage({ type: 'tokenCleared', key: GITHUB_SECRET_KEY });
+        } else if (msg.type === 'clearVercelToken') {
+          await context.secrets.delete(VERCEL_SECRET_KEY);
+          const msgText = 'Token do Vercel removido do armazenamento seguro.';
+          vscode.window.showInformationMessage(msgText);
+          sendLog(msgText);
+          panel.webview.postMessage({ type: 'tokenCleared', key: VERCEL_SECRET_KEY });
+        } else if (msg.type === 'clearRepoUrl') {
+          await context.globalState.update(GLOBAL_REPO_KEY, '');
+          const msgText = 'Repo URL removida.';
+          vscode.window.showInformationMessage(msgText);
+          sendLog(msgText);
+        } else if (msg.type === 'preview') {
+          const file = String(msg.file || '');
+          if (!file) {
+            panel.webview.postMessage({ type: 'preview', file, text: 'No file' });
+            return;
+          }
+          const r = await runCommand(`git diff -- "${file.replace(/"/g, '\\"')}"`, projectRoot, d => sendLog(d));
+          panel.webview.postMessage({ type: 'preview', file, text: r.stdout || r.stderr });
+        } else if (msg.type === 'testDeploy') {
+          panel.webview.postMessage({ type: 'log', text: '🔎 Iniciando checagem (Testar Deploy)...' });
+          const repoUrlFromField = String(msg.repoUrl || '').trim();
+          const repoUrlSaved = context.globalState.get<string>(GLOBAL_REPO_KEY, '').trim();
+          const repoUrlToUse = repoUrlFromField || repoUrlSaved || '';
+          const ghTokenFromField = String(msg.ghToken || '').trim();
+          const ghTokenSaved = await context.secrets.get(GITHUB_SECRET_KEY);
+          const ghTokenToUse = ghTokenFromField || ghTokenSaved || '';
+          sendLog(`Fonte do GitHub token: ${ghTokenFromField ? 'campo' : ghTokenSaved ? 'secrets' : 'nenhum'}`);
+          const vercelTokenFromField = String(msg.vercelToken || '').trim();
+          const vercelTokenSaved = await context.secrets.get(VERCEL_SECRET_KEY);
+          const vercelTokenToUse = vercelTokenFromField || vercelTokenSaved || '';
+          sendLog(`Fonte do Vercel token: ${vercelTokenFromField ? 'campo' : vercelTokenSaved ? 'secrets' : 'nenhum'}`);
+
+          const gitVersion = await runCommand('git --version', projectRoot, d => sendLog(d));
+          const hasGit = gitVersion.ok;
+          panel.webview.postMessage({ type: 'log', text: `git --version: ${gitVersion.stdout || gitVersion.stderr}` });
+
+          let localRepo = false;
+          if (hasGit) {
+            const st = await runCommand('git rev-parse --is-inside-work-tree', projectRoot);
+            localRepo = st.ok && (st.stdout || '').toString().trim() === 'true';
+          }
+          panel.webview.postMessage({ type: 'log', text: `Repositório local: ${localRepo ? 'Sim' : 'Não'}` });
+
+          let ghResult = { ok: false, text: 'Não verificado' };
+          if (!repoUrlToUse) ghResult = { ok: false, text: 'Repo URL não informada (salve a Repo URL ou preencha o campo).' };
+          else {
+            sendLog('🔎 Testando acesso GitHub (ls-remote)...');
+            ghResult = await testGithubAccess(repoUrlToUse, ghTokenToUse);
+          }
+          panel.webview.postMessage({ type: 'log', text: `GitHub: ${ghResult.text}` });
+
+          let vercelResult = { ok: false, text: 'Não verificado' };
+          if (!vercelTokenToUse) vercelResult = { ok: false, text: 'Token Vercel não disponível.' };
+          else {
+            sendLog('🔎 Testando autenticação Vercel (npx vercel whoami)...');
+            vercelResult = await testVercelAccess(vercelTokenToUse);
+          }
+          panel.webview.postMessage({ type: 'log', text: `Vercel: ${vercelResult.text}` });
+
+          const summary = {
+            gitInstalled: hasGit,
+            localRepo,
+            github: ghResult,
+            vercel: vercelResult,
+            repoUrl: repoUrlToUse,
+            ghTokenProvided: !!ghTokenToUse,
+            vercelTokenProvided: !!vercelTokenToUse
+          };
+
+          panel.webview.postMessage({ type: 'testResult', summary });
+          panel.webview.postMessage({ type: 'log', text: '🔎 Teste finalizado.' });
+        } else if (msg.type === 'deploy') {
+          panel.webview.postMessage({ type: 'log', text: 'Iniciando deploy...' });
+          const githubSelected = !!msg.github;
+          const vercelSelected = !!msg.vercel;
+          const repoUrlFromField = String(msg.repoUrl || '').trim();
+          const repoUrlSaved = context.globalState.get<string>(GLOBAL_REPO_KEY, '').trim();
+          let repoUrlToUse = repoUrlSaved;
+          if (repoUrlFromField) {
+            repoUrlToUse = repoUrlFromField;
+            await saveRepoUrlIfNew(repoUrlFromField);
+          }
+
+          const gitExists = fs.existsSync(path.join(projectRoot, '.git'));
+          if (!gitExists && repoUrlToUse) {
+            sendLog('Nenhum repositório Git local encontrado. Inicializando repositório...');
+            await runCommand('git init', projectRoot, d => sendLog(d));
+            await runCommand('git add .', projectRoot, d => sendLog(d));
+            await runCommand('git commit -m "Initial commit (automatic by Deploy Extension)" || true', projectRoot, d => sendLog(d));
+            let remoteUrl = repoUrlToUse;
+            if (githubSelected) {
+              const ghToken = (await context.secrets.get(GITHUB_SECRET_KEY)) || '';
+              if (ghToken && remoteUrl.startsWith('https://')) remoteUrl = remoteUrl.replace('https://', `https://${ghToken}@`);
+            }
+            await runCommand(`git remote add origin "${remoteUrl}"`, projectRoot, d => sendLog(d));
+            await runCommand('git branch -M main', projectRoot, d => sendLog(d));
+            const firstPush = await runCommand('git push -u origin main', projectRoot, d => sendLog(d));
+            sendLog(firstPush.stdout || firstPush.stderr);
+          }
+
+          const branchRes = await runCommand('git rev-parse --abbrev-ref HEAD', projectRoot);
+          const branch = (branchRes.stdout || '').trim() || 'main';
+
+          if (githubSelected) {
+            sendLog('🚀 Fazendo push para o GitHub...');
+            const ghTokenField = String(msg.ghToken || '').trim();
+            const ghTokenSaved2 = await context.secrets.get(GITHUB_SECRET_KEY);
+            const ghToken = ghTokenField || ghTokenSaved2 || '';
+            sendLog(`Usando GitHub token: ${ghTokenField ? 'campo' : ghTokenSaved2 ? 'secrets' : 'nenhum'}`);
+            if (msg.files && msg.files.length) {
+              const quoted = msg.files.map((f: string) => `"${f.replace(/"/g, '\\"')}"`).join(' ');
+              await runCommand(`git add ${quoted}`, projectRoot, d => sendLog(d));
+            } else {
+              await runCommand('git add .', projectRoot, d => sendLog(d));
+            }
+            await runCommand(`git commit -m "${(msg.message || 'deploy: automatic').replace(/"/g, '\\"')}" || true`, projectRoot, d => sendLog(d));
+
+            let pushCmd = `git push origin ${branch}`;
+            if (ghToken) {
+              const remoteUrl = (context.globalState.get<string>(GLOBAL_REPO_KEY, '') || '').trim();
+              if (remoteUrl && remoteUrl.startsWith('https://')) {
+                const tokenRemote = remoteUrl.replace('https://', `https://${ghToken}@`);
+                await runCommand(`git remote set-url origin "${tokenRemote}"`, projectRoot, d => sendLog(d));
+                pushCmd = `git push origin ${branch}`;
+              } else {
+                const repoPath = getRepoPathFromUrl(repoUrlToUse) || '';
+                if (repoPath) pushCmd = `git push https://${ghToken}@github.com/${repoPath} ${branch}`.trim();
+              }
+            }
+            const pushRes = await runCommand(pushCmd, projectRoot, d => sendLog(d));
+            sendLog(pushRes.stdout || pushRes.stderr);
+          }
+
+          if (vercelSelected) {
+            sendLog('⚙️ Executando build e deploy no Vercel...');
+            const build = await runCommand('npm run build', projectRoot, d => sendLog(d));
+            if (!build.ok) {
+              vscode.window.showErrorMessage('Erro no build. Verifique o painel.');
+              sendLog('Build falhou: ' + (build.stderr || ''));
+              return;
+            }
+            const tokenField = String(msg.token || '').trim();
+            const tokenSaved = await context.secrets.get(VERCEL_SECRET_KEY);
+            const token = tokenField || tokenSaved || '';
+            sendLog(`Fonte do Vercel token no deploy: ${tokenField ? 'campo' : tokenSaved ? 'secrets' : 'nenhum'}`);
+            if (!token) {
+              vscode.window.showErrorMessage('Token do Vercel não configurado.');
+              sendLog('Token do Vercel não configurado.');
+              return;
+            }
+            let baseName = path.basename(projectRoot);
+            try {
+              const pkg = JSON.parse(fs.readFileSync(path.join(projectRoot, 'package.json'), 'utf8'));
+              if (pkg && pkg.name) baseName = String(pkg.name);
+            } catch { }
+            const safeName = makeSafeName(baseName) || 'deploy-project';
+            const vercelCmd = `npx vercel --prod --token="${token}" --yes --name="${safeName}"`;
+            const vercelRes = await runCommand(vercelCmd, projectRoot, d => sendLog(d));
+            sendLog(vercelRes.stdout || vercelRes.stderr);
+          }
+
+          sendLog('✅ Deploy finalizado.');
+          await sendStatus();
+        }
+      } catch (err: any) {
+        sendLog('Erro: ' + (err?.message ?? String(err)));
+        vscode.window.showErrorMessage('Erro no processo de deploy: ' + (err?.message ?? String(err)));
+      }
+    });
+
+    // initial status
+    await sendStatus();
+  });
+
+  const clearToken = vscode.commands.registerCommand('deploy-extension.clearVercelToken', async () => {
+    await context.secrets.delete(VERCEL_SECRET_KEY);
+    vscode.window.showInformationMessage('Token do Vercel removido do armazenamento seguro.');
+  });
+
+  context.subscriptions.push(command, clearToken);
+}
+
+export function deactivate() {
+  console.log('Deploy extension deactivated');
 }
 
 
