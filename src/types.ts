@@ -1,0 +1,1 @@
+export type RunResult = { ok: boolean; stdout: string; stderr: string };
