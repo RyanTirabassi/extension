@@ -321,10 +321,10 @@ function getWebviewContent(webview: vscode.Webview, scriptUri: string, styleUri:
 export function activate(context: vscode.ExtensionContext) {
   console.log('🚀 Deploy extension activated');
 
-  const command = vscode.commands.registerCommand('deploy-extension.deploy', async () => {
+  const disposable = vscode.commands.registerCommand('deploy-extension.deploy', async () => {
     const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
+    // fallback para compatibilidade com debug (F5) quando não há pasta aberta
     const projectRoot = workspaceFolder ? workspaceFolder.uri.fsPath : path.resolve(context.extensionUri.fsPath, '..');
-
     if (!fs.existsSync(projectRoot)) {
       vscode.window.showErrorMessage('Pasta do projeto não encontrada. Abra a pasta raiz do projeto.');
       return;
@@ -346,11 +346,19 @@ export function activate(context: vscode.ExtensionContext) {
     panel.webview.html = getWebviewContent(panel.webview, scriptUri.toString(), styleUri.toString(), githubIcon, vercelIcon);
     vscode.window.showInformationMessage('Painel de Deploy aberto!');
 
-    const sendLog = (t: string) => panel.webview.postMessage({ type: 'log', text: String(t) });
+    // defina sendLog UMA VEZ (remova outras declarações duplicadas)
+    function sendLog(t: string) {
+      panel.webview.postMessage({ type: 'log', text: String(t) });
+    }
 
-    // sendStatus: envia apenas arquivos abertos dentro do projectRoot; fallback para git status
+    // report which project root is being used (workspace or fallback)
+    sendLog(`Usando projectRoot: "${projectRoot}" - fonte: ${workspaceFolder ? 'workspace' : 'fallback (extension)'} ` );
+
+    // sendStatus: envia apenas arquivos abertos dentro do projectRoot; fallback para git status (também filtrado)
     async function sendStatus() {
       const projectRootNorm = normalizeFsPath(projectRoot);
+
+      // 1) preferir arquivos abertos dentro do projectRoot
       const openDocsFiltered = vscode.workspace.textDocuments
         .filter(doc => {
           if (doc.isUntitled) return false;
@@ -368,6 +376,7 @@ export function activate(context: vscode.ExtensionContext) {
 
       let files: string[] = openDocsFiltered;
 
+      // 2) se não houver arquivos abertos relevantes, usar `git status` mas garantir que os caminhos pertençam ao projectRoot
       if (!files || files.length === 0) {
         const res = await runCommand('git status --porcelain', projectRoot, d => sendLog(d));
         files = (res.stdout || '')
@@ -375,8 +384,16 @@ export function activate(context: vscode.ExtensionContext) {
           .map(l => l.trim())
           .filter(Boolean)
           .map(l => (l.length > 3 ? l.slice(3).trim() : l.trim()));
+
+        // transformar em caminhos absolutos, filtrar por projectRoot e retornar caminhos relativos para a UI
+        files = files
+          .map(f => path.resolve(projectRoot, f))
+          .filter(abs => normalizeFsPath(abs).startsWith(projectRootNorm))
+          .map(abs => path.relative(projectRoot, abs).replace(/\\/g, '/'));
       }
 
+      // dedupe e envie
+      files = Array.from(new Set(files.filter(Boolean)));
       panel.webview.postMessage({ type: 'status', files });
     }
 
@@ -652,7 +669,7 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.window.showInformationMessage('Token do Vercel removido do armazenamento seguro.');
   });
 
-  context.subscriptions.push(command, clearToken);
+  context.subscriptions.push(disposable, clearToken);
 }
 
 export function deactivate() {
