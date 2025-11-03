@@ -46,6 +46,16 @@ export function registerPanelCommand(context: vscode.ExtensionContext) {
       }
     }
 
+    // helper: commit sem usar operadores shell "|| true" (cross-platform)
+    async function tryCommit(message: string) {
+      const res = await runCommand(`git commit -m "${message.replace(/"/g, '\\"')}"`, projectRoot, d => sendLog(d));
+      // commit pode falhar (nothing to commit) — logamos e prosseguimos
+      if (!res.ok) {
+        sendLog('git commit retornou não-zero (possível: nothing to commit) — prosseguindo.');
+      }
+      return res;
+    }
+
     // report which project root is being used (workspace)
     sendLog(`Usando projectRoot: "${projectRoot}" - fonte: workspace`);
 
@@ -268,21 +278,36 @@ export function registerPanelCommand(context: vscode.ExtensionContext) {
             await saveRepoUrlIfNew(repoUrlFromField);
           }
 
+          // se não tivermos repoUrl, tente descobrir a partir do remote existente
+          if (!repoUrlToUse) {
+            const remoteGet = await runCommand('git remote get-url origin', projectRoot);
+            if (remoteGet.ok) repoUrlToUse = (remoteGet.stdout || '').trim();
+          }
+
           const gitExists = fs.existsSync(path.join(projectRoot, '.git'));
           if (!gitExists && repoUrlToUse) {
             sendLog('Nenhum repositório Git local encontrado. Inicializando repositório...');
             await runCommand('git init', projectRoot, d => sendLog(d));
             await runCommand('git add .', projectRoot, d => sendLog(d));
-            await runCommand('git commit -m "Initial commit (automatic by Deploy Extension)" || true', projectRoot, d => sendLog(d));
+            await tryCommit('Initial commit (automatic by Deploy Extension)');
             let remoteUrl = repoUrlToUse;
             if (githubSelected) {
               const ghToken = (await getSecret(context, GITHUB_SECRET_KEY)) || '';
-              if (ghToken && remoteUrl.startsWith('https://')) remoteUrl = remoteUrl.replace('https://', `https://${ghToken}@`);
+              if (ghToken && remoteUrl && remoteUrl.startsWith('https://')) remoteUrl = remoteUrl.replace(/^https:\/\//, `https://${ghToken}@`);
             }
-            await runCommand(`git remote add origin "${remoteUrl}"`, projectRoot, d => sendLog(d));
-            await runCommand('git branch -M main', projectRoot, d => sendLog(d));
-            const firstPush = await runCommand('git push -u origin main', projectRoot, d => sendLog(d));
-            sendLog(firstPush.stdout || firstPush.stderr);
+            if (remoteUrl) {
+              await runCommand(`git remote add origin "${remoteUrl}"`, projectRoot, d => sendLog(d));
+              await runCommand('git branch -M main', projectRoot, d => sendLog(d));
+              const firstPush = await runCommand('git push -u origin main', projectRoot, d => sendLog(d));
+              sendLog(firstPush.stdout || firstPush.stderr);
+              if (!firstPush.ok && (((firstPush.stderr || '') + (firstPush.stdout || '')).includes('rejected') || ((firstPush.stderr || '') + (firstPush.stdout || '')).includes('fetch'))) {
+                sendLog('Push inicial rejeitado — tentando integrar remoto e repetir push...');
+                const pullRes = await runCommand('git pull --rebase origin main', projectRoot, d => sendLog(d));
+                sendLog(pullRes.stdout || pullRes.stderr);
+                const retryPush = await runCommand('git push -u origin main', projectRoot, d => sendLog(d));
+                sendLog(retryPush.stdout || retryPush.stderr);
+              }
+            }
           }
 
           const branchRes = await runCommand('git rev-parse --abbrev-ref HEAD', projectRoot);
@@ -294,28 +319,44 @@ export function registerPanelCommand(context: vscode.ExtensionContext) {
             const ghTokenSaved2 = await getSecret(context, GITHUB_SECRET_KEY);
             const ghToken = ghTokenField || ghTokenSaved2 || '';
             sendLog(`Usando GitHub token: ${ghTokenField ? 'campo' : ghTokenSaved2 ? 'secrets' : 'nenhum'}`);
+
             if (msg.files && msg.files.length) {
               const quoted = msg.files.map((f: string) => `"${f.replace(/"/g, '\\"')}"`).join(' ');
               await runCommand(`git add ${quoted}`, projectRoot, d => sendLog(d));
             } else {
               await runCommand('git add .', projectRoot, d => sendLog(d));
             }
-            await runCommand(`git commit -m "${(msg.message || 'deploy: automatic').replace(/"/g, '\\"')}" || true`, projectRoot, d => sendLog(d));
+            await tryCommit((msg.message || 'deploy: automatic'));
 
+            // determine remote URL (prefer saved, field, or existing origin)
+            let remoteUrl = (context.globalState.get<string>(GLOBAL_REPO_KEY, '') || '').trim() || repoUrlToUse || '';
+            if (!remoteUrl) {
+              const rem = await runCommand('git remote get-url origin', projectRoot);
+              if (rem.ok) remoteUrl = (rem.stdout || '').trim();
+            }
+
+            // prepare push command and possibly set remote with token
             let pushCmd = `git push origin ${branch}`;
             if (ghToken) {
-              const remoteUrl = (context.globalState.get<string>(GLOBAL_REPO_KEY, '') || '').trim();
               if (remoteUrl && remoteUrl.startsWith('https://')) {
-                const tokenRemote = remoteUrl.replace('https://', `https://${ghToken}@`);
+                const tokenRemote = remoteUrl.replace(/^https:\/\//, `https://${ghToken}@`);
                 await runCommand(`git remote set-url origin "${tokenRemote}"`, projectRoot, d => sendLog(d));
                 pushCmd = `git push origin ${branch}`;
               } else {
-                const repoPath = getRepoPathFromUrl(repoUrlToUse) || '';
+                const repoPath = getRepoPathFromUrl(repoUrlToUse || remoteUrl) || '';
                 if (repoPath) pushCmd = `git push https://${ghToken}@github.com/${repoPath} ${branch}`.trim();
               }
             }
+
             const pushRes = await runCommand(pushCmd, projectRoot, d => sendLog(d));
             sendLog(pushRes.stdout || pushRes.stderr);
+            if (!pushRes.ok && (((pushRes.stderr || '') + (pushRes.stdout || '')).includes('rejected') || ((pushRes.stderr || '') + (pushRes.stdout || '')).includes('fetch'))) {
+              sendLog('Push rejeitado — tentando integrar remoto (git pull --rebase) e repetir push...');
+              const pullRes = await runCommand(`git pull --rebase origin ${branch}`, projectRoot, d => sendLog(d));
+              sendLog(pullRes.stdout || pullRes.stderr);
+              const push2 = await runCommand(pushCmd, projectRoot, d => sendLog(d));
+              sendLog(push2.stdout || push2.stderr);
+            }
           }
 
           if (vercelSelected) {
