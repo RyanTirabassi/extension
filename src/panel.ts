@@ -1,7 +1,7 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
 import * as fs from 'fs';
-import { runCommand, makeSafeName, normalizeFsPath, getRepoPathFromUrl } from './utils';
+import { runCommand, makeSafeName, normalizeFsPath, getRepoPathFromUrl, base64Encode } from './utils';
 import { getWebviewContent } from './webview';
 import { RunResult } from './types';
 import { storeSecret, getSecret, deleteSecret } from './secrets';
@@ -10,10 +10,15 @@ const VERCEL_SECRET_KEY = 'vercelToken';
 const GITHUB_SECRET_KEY = 'githubToken';
 const GLOBAL_REPO_KEY = 'repoUrl';
 
+// helper: chave por workspace (garante que cada pasta armazene sua própria Repo URL)
+function workspaceRepoKey(root: string) {
+  try { return `${GLOBAL_REPO_KEY}:${normalizeFsPath(root)}`; }
+  catch { return GLOBAL_REPO_KEY; }
+}
+
 // registra comando e cria painel (conteúdo e handlers preservados)
 export function registerPanelCommand(context: vscode.ExtensionContext) {
   const disposable = vscode.commands.registerCommand('deploy-extension.deploy', async () => {
-    // exigir pasta de workspace para evitar ler arquivos fora do projeto
     const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
     if (!workspaceFolder) {
       vscode.window.showErrorMessage('Abra uma pasta de projeto no VS Code para usar o Deploy Automático (nenhuma pasta aberta).');
@@ -37,18 +42,46 @@ export function registerPanelCommand(context: vscode.ExtensionContext) {
     panel.webview.html = getWebviewContent(panel.webview, scriptUri.toString(), styleUri.toString(), githubIcon, vercelIcon);
     vscode.window.showInformationMessage('Painel de Deploy aberto!');
 
-    // defina sendLog UMA VEZ
     function sendLog(t: string) {
       try {
         panel.webview.postMessage({ type: 'log', text: String(t) });
+      } catch { /* noop */ }
+    }
+
+    function maskToken(s: string, token?: string) {
+      if (!s) return s;
+      if (!token) return s;
+      try {
+        return String(s).split(token).join('***');
       } catch {
-        /* noop */
+        return s;
       }
     }
 
-    // helper: commit sem usar operadores shell "|| true" (cross-platform)
+    // Remove userinfo (user[:pass]@) de URLs https:// para evitar "Bad hostname"
+    function stripUserInfoFromUrl(url: string) {
+      try {
+        if (!url) return url;
+        return String(url).replace(/^(https?:\/\/)[^@\/]+@/i, '$1');
+      } catch {
+        return url;
+      }
+    }
+
+    // Extrai token/userinfo de uma URL (se existir) sem salvar; retorna token (parte user antes de ':') ou ''
+    function extractTokenFromUrl(url: string) {
+      try {
+        if (!url) return '';
+        const m = String(url).match(/^(https?:\/\/)([^@\/]+)@/i);
+        if (!m) return '';
+        const userinfo = m[2]; // ex: github_pat_xxx[:password]
+        const tokenPart = userinfo.split(':')[0] || '';
+        try { return decodeURIComponent(tokenPart); } catch { return tokenPart; }
+      } catch { return ''; }
+    }
+
     async function tryCommit(message: string) {
-      const res = await runCommand(`git commit -m "${message.replace(/"/g, '\\"')}"`, projectRoot, d => sendLog(d));
+      const res = await runCommand(`git commit -m "${message.replace(/"/g, '\\"')}"`, projectRoot, d => sendLog(maskToken(d)));
       // commit pode falhar (nothing to commit) — logamos e prosseguimos
       if (!res.ok) {
         sendLog('git commit retornou não-zero (possível: nothing to commit) — prosseguindo.');
@@ -56,14 +89,37 @@ export function registerPanelCommand(context: vscode.ExtensionContext) {
       return res;
     }
 
-    // report which project root is being used (workspace)
+    // push usando header Authorization Basic (evita prompts do credential manager)
+    async function pushWithToken(repoUrl: string, token: string, branch: string) {
+  if (!repoUrl || !token) {
+    return { ok: false, stdout: '', stderr: 'repoUrl ou token ausente' } as RunResult;
+  }
+
+  // remove userinfo e normaliza
+  const cleanUrl = stripUserInfoFromUrl(repoUrl).replace(/\/+$/, '');
+  const headerVal = base64Encode(`x-access-token:${token}`);
+
+  // usa exatamente a URL fornecida, sem recriar a partir de repoPath
+  const cmd = `git -c http.extraHeader="Authorization: Basic ${headerVal}" push "${cleanUrl}" ${branch}`;
+
+  const res = await runCommand(cmd, projectRoot, d => sendLog(maskToken(d, token)));
+
+  if (!res.ok && (((res.stderr || '') + (res.stdout || '')).toLowerCase().includes('rejected') ||
+    ((res.stderr || '') + (res.stdout || '')).toLowerCase().includes('fetch'))) {
+    sendLog('Push rejeitado — tentando rebase e repetir push...');
+    await runCommand(`git -c http.extraHeader="Authorization: Basic ${headerVal}" pull --rebase "${cleanUrl}" ${branch}`, projectRoot, d => sendLog(maskToken(d, token)));
+    const retry = await runCommand(cmd, projectRoot, d => sendLog(maskToken(d, token)));
+    return retry;
+  }
+
+  return res;
+}
+
+
     sendLog(`Usando projectRoot: "${projectRoot}" - fonte: workspace`);
 
-    // sendStatus: envia apenas arquivos abertos dentro do projectRoot; fallback para git status (também filtrado)
     async function sendStatus() {
       const projectRootNorm = normalizeFsPath(projectRoot);
-
-      // 1) preferir arquivos abertos dentro do projectRoot
       const openDocsFiltered = vscode.workspace.textDocuments
         .filter(doc => {
           if (doc.isUntitled) return false;
@@ -81,7 +137,6 @@ export function registerPanelCommand(context: vscode.ExtensionContext) {
 
       let files: string[] = openDocsFiltered;
 
-      // 2) se não houver arquivos abertos relevantes, usar `git status` mas garantir que os caminhos pertençam ao projectRoot
       if (!files || files.length === 0) {
         const res = await runCommand('git status --porcelain', projectRoot, d => sendLog(d));
         files = (res.stdout || '')
@@ -90,19 +145,16 @@ export function registerPanelCommand(context: vscode.ExtensionContext) {
           .filter(Boolean)
           .map(l => (l.length > 3 ? l.slice(3).trim() : l.trim()));
 
-        // transformar em caminhos absolutos, filtrar por projectRoot e retornar caminhos relativos para a UI
         files = files
           .map(f => path.resolve(projectRoot, f))
           .filter(abs => normalizeFsPath(abs).startsWith(projectRootNorm))
           .map(abs => path.relative(projectRoot, abs).replace(/\\/g, '/'));
       }
 
-      // dedupe e envie
       files = Array.from(new Set((files || []).filter(Boolean)));
       panel.webview.postMessage({ type: 'status', files });
     }
 
-    // helpers used by handlers below (save tokens/repo, tests and deploy)
     async function saveSecretIfNew(secretKey: string, token: string, label: string) {
       const normalized = String(token || '').trim();
       if (!normalized) {
@@ -128,21 +180,24 @@ export function registerPanelCommand(context: vscode.ExtensionContext) {
 
     async function saveRepoUrlIfNew(url: string) {
       const normalized = String(url || '').trim();
-      if (!normalized) {
+      // remove userinfo e barra final antes de salvar
+      const sanitized = stripUserInfoFromUrl(normalized).replace(/\/+$/, '');
+      if (!sanitized) {
         vscode.window.showWarningMessage('Repo URL vazio. Informe uma URL válida.');
         sendLog('Repo URL vazio. Nada salvo.');
         panel.webview.postMessage({ type: 'repoSaveResult', ok: false, text: 'vazio' });
         return;
       }
-      const existing = context.globalState.get<string>(GLOBAL_REPO_KEY, '');
-      if (existing === normalized) {
+      const key = workspaceRepoKey(projectRoot);
+      const existing = context.workspaceState.get<string>(key, '');
+      if (existing === sanitized) {
         const msg = 'Repo URL já salvo.';
         vscode.window.showWarningMessage(msg);
         sendLog(msg);
         panel.webview.postMessage({ type: 'repoSaveResult', ok: false, text: 'duplicado' });
         return;
       }
-      await context.globalState.update(GLOBAL_REPO_KEY, normalized);
+      await context.workspaceState.update(key, sanitized);
       const msg = 'Repo URL salvo com segurança.';
       vscode.window.showInformationMessage(msg);
       sendLog(msg);
@@ -154,10 +209,18 @@ export function registerPanelCommand(context: vscode.ExtensionContext) {
         const repoPath = getRepoPathFromUrl(repoUrl);
         if (!repoPath) return { ok: false, text: 'Repo URL inválida ou não informada.' };
         let testUrl = repoUrl || `https://github.com/${repoPath}.git`;
-        if (ghToken && testUrl.startsWith('https://')) testUrl = testUrl.replace('https://', `https://${ghToken}@`);
-        const res = await runCommand(`git ls-remote --exit-code "${testUrl}"`, projectRoot, d => sendLog(d));
-        if (res.ok) return { ok: true, text: 'Acesso ao GitHub OK (ls-remote funcionou).' };
-        return { ok: false, text: 'Falha ao acessar repositório remoto: ' + (res.stderr || res.stdout) };
+        if (ghToken && testUrl.startsWith('https://')) {
+          // use header approach for test too
+          const headerVal = base64Encode(`x-access-token:${ghToken}`);
+          const cmd = `git -c http.extraHeader="Authorization: Basic ${headerVal}" ls-remote --exit-code https://github.com/${repoPath}.git`;
+          const res = await runCommand(cmd, projectRoot, d => sendLog(maskToken(d, ghToken)));
+          if (res.ok) return { ok: true, text: 'Acesso ao GitHub OK (ls-remote funcionou).' };
+          return { ok: false, text: 'Falha ao acessar repositório remoto: ' + (res.stderr || res.stdout) };
+        } else {
+          const res = await runCommand(`git ls-remote --exit-code "${testUrl}"`, projectRoot, d => sendLog(d));
+          if (res.ok) return { ok: true, text: 'Acesso ao GitHub OK (ls-remote funcionou).' };
+          return { ok: false, text: 'Falha ao acessar repositório remoto: ' + (res.stderr || res.stdout) };
+        }
       } catch (err: any) {
         return { ok: false, text: 'Erro testando GitHub: ' + (err?.message ?? String(err)) };
       }
@@ -177,7 +240,6 @@ export function registerPanelCommand(context: vscode.ExtensionContext) {
       }
     }
 
-    // message handler
     panel.webview.onDidReceiveMessage(async (msg: any) => {
       try {
         if (msg.type === 'requestStatus') {
@@ -201,7 +263,7 @@ export function registerPanelCommand(context: vscode.ExtensionContext) {
           sendLog(msgText);
           panel.webview.postMessage({ type: 'tokenCleared', key: VERCEL_SECRET_KEY });
         } else if (msg.type === 'clearRepoUrl') {
-          await context.globalState.update(GLOBAL_REPO_KEY, '');
+          await context.workspaceState.update(workspaceRepoKey(projectRoot), '');
           const msgText = 'Repo URL removida.';
           vscode.window.showInformationMessage(msgText);
           sendLog(msgText);
@@ -216,7 +278,7 @@ export function registerPanelCommand(context: vscode.ExtensionContext) {
         } else if (msg.type === 'testDeploy') {
           panel.webview.postMessage({ type: 'log', text: '🔎 Iniciando checagem (Testar Deploy)...' });
           const repoUrlFromField = String(msg.repoUrl || '').trim();
-          const repoUrlSaved = context.globalState.get<string>(GLOBAL_REPO_KEY, '').trim();
+          const repoUrlSaved = context.workspaceState.get<string>(workspaceRepoKey(projectRoot), '').trim();
           const repoUrlToUse = repoUrlFromField || repoUrlSaved || '';
           const ghTokenFromField = String(msg.ghToken || '').trim();
           const ghTokenSaved = await getSecret(context, GITHUB_SECRET_KEY);
@@ -271,14 +333,25 @@ export function registerPanelCommand(context: vscode.ExtensionContext) {
           const githubSelected = !!msg.github;
           const vercelSelected = !!msg.vercel;
           const repoUrlFromField = String(msg.repoUrl || '').trim();
-          const repoUrlSaved = context.globalState.get<string>(GLOBAL_REPO_KEY, '').trim();
-          let repoUrlToUse = repoUrlSaved;
+          const repoUrlSaved = String(context.workspaceState.get<string>(workspaceRepoKey(projectRoot), '') || '').trim();
+          // prefer campo; sempre sanitize (remove userinfo e barra final) antes de usar
+          let repoUrlToUse = '';
           if (repoUrlFromField) {
-            repoUrlToUse = repoUrlFromField;
+            const s = stripUserInfoFromUrl(repoUrlFromField).replace(/\/+$/, '');
+            repoUrlToUse = s;
+            // salva a versão sanitizada (saveRepoUrlIfNew sanitiza também, mas manter consistência)
             await saveRepoUrlIfNew(repoUrlFromField);
+          } else if (repoUrlSaved) {
+            // ⚠️ Verifica se repo salvo ainda é válido e corresponde ao repositório atual
+            const sanitized = stripUserInfoFromUrl(repoUrlSaved).replace(/\/+$/, '');
+             if (sanitized.includes('Primeira-aplica-o.git')) {
+             sendLog('Repo salvo antigo detectado — ignorando cache.');
+             repoUrlToUse = '';
+           } else {
+          repoUrlToUse = sanitized;
+         }
           }
 
-          // se não tivermos repoUrl, tente descobrir a partir do remote existente
           if (!repoUrlToUse) {
             const remoteGet = await runCommand('git remote get-url origin', projectRoot);
             if (remoteGet.ok) repoUrlToUse = (remoteGet.stdout || '').trim();
@@ -290,23 +363,32 @@ export function registerPanelCommand(context: vscode.ExtensionContext) {
             await runCommand('git init', projectRoot, d => sendLog(d));
             await runCommand('git add .', projectRoot, d => sendLog(d));
             await tryCommit('Initial commit (automatic by Deploy Extension)');
-            let remoteUrl = repoUrlToUse;
+
+            // sanitize remote URL (remove eventual token/userinfo)
+            const rawRemoteUrl = repoUrlToUse;
+            const sanitizedRemoteUrl = stripUserInfoFromUrl(rawRemoteUrl);
             if (githubSelected) {
               const ghToken = (await getSecret(context, GITHUB_SECRET_KEY)) || '';
-              if (ghToken && remoteUrl && remoteUrl.startsWith('https://')) remoteUrl = remoteUrl.replace(/^https:\/\//, `https://${ghToken}@`);
-            }
-            if (remoteUrl) {
-              await runCommand(`git remote add origin "${remoteUrl}"`, projectRoot, d => sendLog(d));
+              const repoPath = getRepoPathFromUrl(sanitizedRemoteUrl);
+              // add sanitized origin (never add tokenized URL)
+
+              await runCommand('git remote remove origin || true', projectRoot);
+              await runCommand(`git remote add origin "${sanitizedRemoteUrl}"`, projectRoot);
+
+              await runCommand(`git remote add origin "${sanitizedRemoteUrl}"`, projectRoot, d => sendLog(d));
+              await runCommand('git branch -M main', projectRoot, d => sendLog(d));
+              if (ghToken && repoPath) {
+                const firstPush = await pushWithToken(repoPath, ghToken, 'main');
+                sendLog(maskToken(firstPush.stdout || firstPush.stderr, ghToken));
+              } else {
+                const firstPush = await runCommand('git push -u origin main', projectRoot, d => sendLog(d));
+                sendLog(firstPush.stdout || firstPush.stderr);
+              }
+            } else {
+              await runCommand(`git remote add origin "${sanitizedRemoteUrl}"`, projectRoot, d => sendLog(d));
               await runCommand('git branch -M main', projectRoot, d => sendLog(d));
               const firstPush = await runCommand('git push -u origin main', projectRoot, d => sendLog(d));
               sendLog(firstPush.stdout || firstPush.stderr);
-              if (!firstPush.ok && (((firstPush.stderr || '') + (firstPush.stdout || '')).includes('rejected') || ((firstPush.stderr || '') + (firstPush.stdout || '')).includes('fetch'))) {
-                sendLog('Push inicial rejeitado — tentando integrar remoto e repetir push...');
-                const pullRes = await runCommand('git pull --rebase origin main', projectRoot, d => sendLog(d));
-                sendLog(pullRes.stdout || pullRes.stderr);
-                const retryPush = await runCommand('git push -u origin main', projectRoot, d => sendLog(d));
-                sendLog(retryPush.stdout || retryPush.stderr);
-              }
             }
           }
 
@@ -328,34 +410,83 @@ export function registerPanelCommand(context: vscode.ExtensionContext) {
             }
             await tryCommit((msg.message || 'deploy: automatic'));
 
-            // determine remote URL (prefer saved, field, or existing origin)
-            let remoteUrl = (context.globalState.get<string>(GLOBAL_REPO_KEY, '') || '').trim() || repoUrlToUse || '';
-            if (!remoteUrl) {
-              const rem = await runCommand('git remote get-url origin', projectRoot);
-              if (rem.ok) remoteUrl = (rem.stdout || '').trim();
-            }
+            // 🔧 Corrige leitura incorreta do repositório salvo
+let remoteUrl = '';
+const storedUrl = context.workspaceState.get<string>(workspaceRepoKey(projectRoot));
+if (storedUrl && storedUrl.trim() && !storedUrl.includes('Primeira-aplica-o.git')) {
+  remoteUrl = storedUrl.trim();
+} else {
+  remoteUrl = repoUrlToUse;
+  // força regravar o valor correto e eliminar cache antigo
+  await context.workspaceState.update(workspaceRepoKey(projectRoot), repoUrlToUse);
+}
 
-            // prepare push command and possibly set remote with token
-            let pushCmd = `git push origin ${branch}`;
-            if (ghToken) {
-              if (remoteUrl && remoteUrl.startsWith('https://')) {
-                const tokenRemote = remoteUrl.replace(/^https:\/\//, `https://${ghToken}@`);
-                await runCommand(`git remote set-url origin "${tokenRemote}"`, projectRoot, d => sendLog(d));
-                pushCmd = `git push origin ${branch}`;
-              } else {
-                const repoPath = getRepoPathFromUrl(repoUrlToUse || remoteUrl) || '';
-                if (repoPath) pushCmd = `git push https://${ghToken}@github.com/${repoPath} ${branch}`.trim();
+// Se ainda não há remote, tenta obter do Git
+if (!remoteUrl) {
+  const rem = await runCommand('git remote get-url origin', projectRoot);
+  if (rem.ok) remoteUrl = (rem.stdout || '').trim();
+}
+
+
+            // sanitize remote URL (remove userinfo if user saved tokenized URL)
+            const rawRemote = remoteUrl || '';
+            const sanitizedRemote = stripUserInfoFromUrl(rawRemote);
+
+            // ensure origin exists and points to sanitized URL (avoid token-in-url causing "Bad hostname")
+            const originCheck = await runCommand('git remote get-url origin', projectRoot);
+            // se origin existir e contiver credenciais embutidas — capture token (não salvo) e sanitize origin
+            let tokenFromOrigin = '';
+            if (originCheck.ok) {
+              const currentOrigin = (originCheck.stdout || '').trim();
+              const currentHasCreds = currentOrigin && currentOrigin !== sanitizedRemote;
+              if (currentHasCreds) {
+                sendLog('Origin contém credenciais na URL. Extraindo token (não salvo) e substituindo por URL sanitizada.');
+                tokenFromOrigin = extractTokenFromUrl(currentOrigin) || '';
+                await runCommand(`git remote set-url origin "${sanitizedRemote}"`, projectRoot, d => sendLog(maskToken(d, tokenFromOrigin)));
               }
+            } else if (!originCheck.ok && sanitizedRemote) {
+              await runCommand(`git remote add origin "${sanitizedRemote}"`, projectRoot, d => sendLog(d));
             }
 
-            const pushRes = await runCommand(pushCmd, projectRoot, d => sendLog(d));
-            sendLog(pushRes.stdout || pushRes.stderr);
-            if (!pushRes.ok && (((pushRes.stderr || '') + (pushRes.stdout || '')).includes('rejected') || ((pushRes.stderr || '') + (pushRes.stdout || '')).includes('fetch'))) {
-              sendLog('Push rejeitado — tentando integrar remoto (git pull --rebase) e repetir push...');
-              const pullRes = await runCommand(`git pull --rebase origin ${branch}`, projectRoot, d => sendLog(d));
-              sendLog(pullRes.stdout || pullRes.stderr);
-              const push2 = await runCommand(pushCmd, projectRoot, d => sendLog(d));
-              sendLog(push2.stdout || push2.stderr);
+            // escolha de token: campo > secret salvo > token extraído da origin
+            const effectiveToken = ghToken || tokenFromOrigin || '';
+            const repoPath = getRepoPathFromUrl(sanitizedRemote || remoteUrl || '') || '';
+
+            if (effectiveToken && repoPath) {
+              const pushRes = await pushWithToken(sanitizedRemote, effectiveToken, branch);
+              sendLog(maskToken(pushRes.stdout || pushRes.stderr, effectiveToken));
+            } else {
+              // Sem token: tentar fallback SSH (se houver chave SSH configurada para github.com)
+              sendLog('Sem token — tentando fallback SSH (se chave SSH configurada)...');
+              const possibleRepoPath = repoPath || getRepoPathFromUrl(sanitizedRemote || remoteUrl || '');
+              if (!possibleRepoPath) {
+                sendLog('Repo path não detectado — impossível tentar SSH. Forneça token ou configure remote SSH.');
+                vscode.window.showWarningMessage('Deploy GitHub cancelado: repo inválido. Forneça token ou configure SSH.');
+              } else {
+                // testar autenticação SSH sem prompts
+                const sshTest = await runCommand('ssh -o BatchMode=yes -T git@github.com', projectRoot, d => sendLog(d));
+                const sshOk = sshTest.ok || /successfully authenticated/i.test((sshTest.stdout || '') + (sshTest.stderr || ''));
+                if (!sshOk) {
+                  sendLog('Fallback SSH falhou (sem chave autenticada). Push cancelado.');
+                  vscode.window.showWarningMessage('Deploy GitHub cancelado: sem token e SSH não autenticado. Configure token ou SSH.');
+                } else {
+                  const sshUrl = `git@github.com:${possibleRepoPath}.git`;
+                  sendLog(`SSH autenticado — usando URL SSH temporária: ${sshUrl}`);
+                  // salvar origin atual para restaurar
+                  const originCheck2 = await runCommand('git remote get-url origin', projectRoot);
+                  const oldOrigin = originCheck2.ok ? (originCheck2.stdout || '').trim() : '';
+                  // set origin para ssh e push
+                  await runCommand(`git remote set-url origin "${sshUrl}"`, projectRoot, d => sendLog(d));
+                  const pushRes = await runCommand(`git push origin ${branch}`, projectRoot, d => sendLog(d));
+                  sendLog(pushRes.stdout || pushRes.stderr);
+                  // restaurar origin anterior (ou remover se não havia)
+                  if (oldOrigin) {
+                    await runCommand(`git remote set-url origin "${oldOrigin}"`, projectRoot, d => sendLog(d));
+                  } else {
+                    await runCommand('git remote remove origin', projectRoot, d => sendLog(d));
+                  }
+                }
+              }
             }
           }
 
@@ -396,7 +527,6 @@ export function registerPanelCommand(context: vscode.ExtensionContext) {
       }
     });
 
-    // initial status
     await sendStatus();
   });
 

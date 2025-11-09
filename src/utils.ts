@@ -5,7 +5,10 @@ import { RunResult } from './types';
 
 export function runCommand(cmd: string, cwd: string, onData?: (d: string) => void): Promise<RunResult> {
   return new Promise(resolve => {
-    const p = exec(cmd, { cwd, maxBuffer: 1024 * 1024 * 10 }, (err, stdout, stderr) => {
+    // evita prompts interativos e instruí o Git Credential Manager a não abrir UI
+    const env = Object.assign({}, process.env, { GIT_TERMINAL_PROMPT: '0', GCM_INTERACTIVE: 'never' });
+
+    const p = exec(cmd, { cwd, maxBuffer: 1024 * 1024 * 10, env, windowsHide: true }, (err, stdout, stderr) => {
       if (err) resolve({ ok: false, stdout: stdout ?? '', stderr: stderr ?? (err.message ?? '') });
       else resolve({ ok: true, stdout: stdout ?? '', stderr: stderr ?? '' });
     });
@@ -30,17 +33,16 @@ export function normalizeFsPath(p: string) {
 export function getRepoPathFromUrl(url?: string) {
   if (!url) return '';
   try {
-    let u = String(url).trim();
-    if (u.startsWith('https://')) u = u.replace('https://', '');
-    if (u.includes('@')) {
-      const parts = u.split('@');
-      u = parts[parts.length - 1];
-    }
-    const parts = u.split('/');
-    const owner = parts[1] || '';
-    const repo = (parts[2] || '').replace(/\.git$/, '');
-    return owner && repo ? `${owner}/${repo}` : '';
+    const u = String(url).trim();
+    // Match end-of-string owner/repo (handles https and ssh forms)
+    const m = u.match(/(?:[:\/])([^\/:]+\/[^\/]+?)(?:\.git)?$/);
+    if (m && m[1]) return m[1].replace(/\.git$/, '');
+    return '';
   } catch {
     return '';
   }
+}
+
+export function base64Encode(input: string) {
+  return Buffer.from(String(input || ''), 'utf8').toString('base64');
 }

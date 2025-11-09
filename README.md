@@ -35,5 +35,3 @@ Desenvolvido como projeto integrador das disciplinas **Front End**, **Back End**
 2. Compile a extensão:  
    ```bash
    npm run compile
-
-   ......
