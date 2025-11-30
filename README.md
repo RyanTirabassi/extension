@@ -1,37 +1,148 @@
-# 🚀 Deploy Automático — Extensão VS Code  
-**Autor:** Ryan Tirabassi  
-**Disciplinas:** Front End, Back End, DevOps e Estruturas de Dados  
+# 🚀 Deploy Automático v2
 
----
+Automatize build e deploy de aplicações React com GitHub Actions para Vercel.
 
-## 🧠 Sobre o Projeto
-O **Deploy Automático** é uma extensão para o **Visual Studio Code** que permite realizar **commits, push para o GitHub e deploys no Vercel** diretamente do editor.  
-O objetivo é simplificar o processo de publicação de aplicações web, unificando Git, Build e Deploy em uma única interface.
+## 📋 Requisitos
 
-Desenvolvido como projeto integrador das disciplinas **Front End**, **Back End**, **DevOps** e **Estruturas de Dados**.
+- **VS Code** 1.80.0 ou superior
+- **Node.js** 16+ 
+- **Git** instalado
+- **npm** ou **yarn**
 
----
+## 🔧 Instalação
 
-## ⚙️ Funcionalidades
-- 📁 Exibe os arquivos modificados do repositório (`git status`)  
-- 👀 Permite visualizar o diff de cada arquivo antes do commit  
-- 🧩 Realiza `git add`, `git commit` e `git push` diretamente  
-- ⚡ Executa `npm run build` e `npx vercel --prod` para deploy automatizado  
-- 🔒 Armazena o **token da Vercel** de forma segura usando `context.secrets`  
-- 💬 Interface amigável integrada ao VS Code
+### 1. Clone o repositório
 
----
+```bash
+git clone <seu-repositorio>
+cd deploy-automatico
+```
 
-## 🧰 Requisitos
-- **Git** instalado e configurado (`git config --global user.name/email`)  
-- **Node.js** e **npm**  
-- **Vercel CLI** (opcional — `npx vercel` funciona sem instalar globalmente)  
-- Repositório Git configurado com remote no **GitHub**
+### 2. Instale as dependências
 
----
+```bash
+npm install
+```
 
-## ▶️ Como Usar em Desenvolvimento
-1. Clone este repositório e abra-o no **VS Code**.  
-2. Compile a extensão:  
-   ```bash
-   npm run compile
+### 3. Compile o projeto
+
+```bash
+npm run compile
+```
+
+### 4. Inicie o modo watch (opcional)
+
+```bash
+npm run watch
+```
+
+## 🎯 Estrutura de Arquivos
+
+```
+deploy-automatico/
+├── src/
+│   ├── extension.ts      # Arquivo principal
+│   ├── panel.ts          # Lógica do painel
+│   ├── webview.ts        # HTML/CSS/JS da UI
+│   ├── utils.ts          # Funções utilitárias
+│   ├── secrets.ts        # Gerenciamento de secrets
+│   └── types.ts          # Tipos TypeScript
+├── package.json          # Metadados do projeto
+├── tsconfig.json         # Configuração TypeScript
+└── README.md             # Este arquivo
+```
+
+## 🚀 Como Usar
+
+### 1. Abra um projeto no VS Code
+
+```bash
+code seu-projeto
+```
+
+### 2. Abra o Command Palette (Ctrl+Shift+P / Cmd+Shift+P)
+
+### 3. Digite: **Deploy Automático v2**
+
+### 4. Configure seus tokens e URLs:
+
+#### Aba TOKEN
+- ✅ Salve seu **GitHub Token** (Personal Access Token)
+- ✅ Salve sua **URL do Repositório**
+- ✅ Salve seu **Vercel Token** (opcional)
+- 🚀 Clique em **DEPLOY**
+
+#### Aba SSH
+- 🔐 Configure SSH no GitHub (Settings → SSH Keys)
+- 📝 Adicione sua URL SSH
+- 🚀 Clique em **DEPLOY SSH**
+
+#### Aba TEMPLATE
+- 📋 Cole um template YAML do GitHub Actions
+- ✅ Clique em **APLICAR**
+- 📂 Arquivo será criado em `.github/workflows/deploy.yml`
+
+#### Aba TESTE
+- ⚡ Clique em **EXECUTAR TESTES**
+- 📊 Veja os resultados em tempo real
+- 📋 Logs aparecem à direita
+
+## 🔑 Gerando Tokens
+
+### GitHub Token
+1. Vá para: github.com/settings/tokens
+2. Clique em "Generate new token (classic)"
+3. Selecione escopos: `repo`, `workflow`
+4. Copie o token e cole na extensão
+
+### Vercel Token
+1. Vá para: vercel.com/account/tokens
+2. Crie um novo token
+3. Copie e cole na extensão
+
+## 🛠️ Desenvolvimento
+
+### Build para produção
+
+```bash
+npm run esbuild-base -- --minify
+```
+
+### Publicar a extensão
+
+```bash
+vsce publish
+```
+
+## 📝 Notas Importantes
+
+- ⚠️ **Nunca compartilhe seus tokens**
+- 🔒 Tokens são armazenados de forma segura pelo VS Code
+- 📌 Configure o repositório Git antes de usar
+- 🔄 Use `main` ou `master` como branch principal
+
+## 🐛 Troubleshooting
+
+### "Git not found"
+- Instale o Git: https://git-scm.com
+
+### "Push rejected"
+- Verifique as permissões do token
+- Confirme que o repositório remote está configurado
+
+### "Vercel command not found"
+- Execute: `npm install -g vercel`
+
+## 📚 Referências
+
+- [GitHub Actions Documentation](https://docs.github.com/actions)
+- [Vercel Documentation](https://vercel.com/docs)
+- [VS Code Extension API](https://code.visualstudio.com/api)
+
+## 📄 Licença
+
+MIT
+
+## 👥 Contribuições
+
+Contribuições são bem-vindas! Abra uma issue ou pull request.
