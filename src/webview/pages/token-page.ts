@@ -28,7 +28,12 @@ export const tokenPageHTML = `
       <span>GitHub Token</span>
       <span class="field-status" id="gh-status">● Não salvo</span>
     </div>
-    <input type="password" id="ghToken" placeholder="ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx">
+    <input 
+      type="password" 
+      id="ghToken" 
+      placeholder="ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      oninput="validateGithubToken(this)">
+    <div class="validation-hint" id="gh-validation" style="display: none;"></div>
     <div class="button-group">
       <button class="btn-primary" onclick="saveGhToken()">✅ SALVAR</button>
       <button class="btn-secondary" onclick="clearGhToken()">🗑️ REMOVER</button>
@@ -42,7 +47,12 @@ export const tokenPageHTML = `
       <span>Vercel Token</span>
       <span class="field-status" id="vercel-status">● Não salvo</span>
     </div>
-    <input type="password" id="vercelToken" placeholder="vercel_xxxxxxxxxxxxxxxx">
+    <input 
+      type="password" 
+      id="vercelToken" 
+      placeholder="vercel_xxxxxxxxxxxxxxxx"
+      oninput="validateVercelToken(this)">
+    <div class="validation-hint" id="vercel-validation" style="display: none;"></div>
     <div class="button-group">
       <button class="btn-primary" onclick="saveVercelToken()">✅ SALVAR</button>
       <button class="btn-secondary" onclick="clearVercelToken()">🗑️ REMOVER</button>
@@ -53,7 +63,12 @@ export const tokenPageHTML = `
 
   <div class="field-group">
     <div class="field-label">URL do Repositório</div>
-    <input type="url" id="repoUrl" placeholder="https://github.com/seu-usuario/seu-repo.git">
+    <input 
+      type="url" 
+      id="repoUrl" 
+      placeholder="https://github.com/seu-usuario/seu-repo.git"
+      oninput="validateRepoUrl(this)">
+    <div class="validation-hint" id="url-validation" style="display: none;"></div>
     <div class="button-group">
       <button class="btn-primary" onclick="saveRepoUrl()">💾 SALVAR</button>
       <button class="btn-secondary" onclick="testGithubAccess()">⚡ TESTAR ACESSO</button>
@@ -111,5 +126,45 @@ export const tokenPageStyles = `
 .auth-method-name {
   font-size: 12px;
   font-weight: 600;
+}
+
+/* Validation hints */
+.validation-hint {
+  font-size: 10px;
+  padding: 6px 10px;
+  margin-top: 4px;
+  border-radius: 3px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.validation-hint.valid {
+  background: rgba(78, 201, 176, 0.1);
+  color: #4ec9b0;
+  border: 1px solid rgba(78, 201, 176, 0.3);
+}
+
+.validation-hint.invalid {
+  background: rgba(244, 135, 113, 0.1);
+  color: #f48771;
+  border: 1px solid rgba(244, 135, 113, 0.3);
+}
+
+.validation-hint.warning {
+  background: rgba(220, 220, 170, 0.1);
+  color: #dcdcaa;
+  border: 1px solid rgba(220, 220, 170, 0.3);
+}
+
+/* Input validation states */
+input.valid {
+  border-color: #4ec9b0 !important;
+  background: rgba(78, 201, 176, 0.05) !important;
+}
+
+input.invalid {
+  border-color: #f48771 !important;
+  background: rgba(244, 135, 113, 0.05) !important;
 }
 `;
